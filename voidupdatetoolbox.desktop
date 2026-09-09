@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Void Update Toolbox
+Comment=Sync, update, and clean XBPS packages — package management only
+Exec=__EXEC_PATH__
+Icon=voidupdatetoolbox
+Categories=System;PackageManager;
+Terminal=false

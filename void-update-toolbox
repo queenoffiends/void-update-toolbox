@@ -1,0 +1,454 @@
+#!/usr/bin/env python3
+"""
+Void Update Toolbox
+--------------------
+A minimal GUI front-end for XBPS package updates on Void Linux,
+modeled after Garuda's update-toolbox concept but deliberately
+scoped to ONLY package-management actions:
+
+    - sync repository data
+    - check for available updates (dry run)
+    - apply a full system update
+    - remove orphaned packages
+    - clean the local package download cache
+
+It never touches configs, services, bootloaders, users, mirrors,
+or anything else - just xbps-install / xbps-remove.
+
+Pure Tkinter, no extra dependencies beyond python3-tkinter.
+"""
+
+import re
+import shutil
+import subprocess
+import threading
+import tkinter as tk
+import tkinter.font as tkfont
+from tkinter import ttk, messagebox
+
+APP_TITLE = "Void Update Toolbox"
+
+# ---------------------------------------------------------------- palette --
+BG = "#070b14"          # near-black navy backdrop
+PANEL_BG = "#0c1322"    # slightly lifted panel
+LOG_BG = "#080d18"
+BORDER = "#1c2b47"
+TEXT_MAIN = "#dbe6f7"
+TEXT_DIM = "#5f7699"
+CYAN = "#2ee6ff"
+CYAN_DIM = "#0f6f80"
+MAGENTA = "#ff3fd6"
+MAGENTA_DIM = "#7a1e69"
+AMBER = "#ffb43f"
+AMBER_DIM = "#7a5c22"
+GREEN = "#3dffb0"
+GREEN_DIM = "#1f7a5c"
+RED = "#ff5470"
+
+
+def find_privilege_helper():
+    """Prefer pkexec (GUI polkit prompt); fall back to sudo."""
+    for helper in ("pkexec", "sudo"):
+        if shutil.which(helper):
+            return helper
+    return None
+
+
+def pick_font(root, candidates, size, weight="normal"):
+    available = set(tkfont.families(root))
+    for name in candidates:
+        if name in available:
+            return tkfont.Font(family=name, size=size, weight=weight)
+    return tkfont.Font(family="TkDefaultFont", size=size, weight=weight)
+
+
+def spaced(text, gap="  "):
+    """Letter-space a string for a HUD/console look, e.g. 'V O I D'."""
+    return gap.join(list(text))
+
+
+def lerp_color(c1, c2, t):
+    c1 = c1.lstrip("#")
+    c2 = c2.lstrip("#")
+    r1, g1, b1 = int(c1[0:2], 16), int(c1[2:4], 16), int(c1[4:6], 16)
+    r2, g2, b2 = int(c2[0:2], 16), int(c2[2:4], 16), int(c2[4:6], 16)
+    r = round(r1 + (r2 - r1) * t)
+    g = round(g1 + (g2 - g1) * t)
+    b = round(b1 + (b2 - b1) * t)
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+class ToolboxApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title(f"{APP_TITLE} \u2014 XBPS Control")
+        self.geometry("820x580")
+        self.minsize(680, 460)
+        self.configure(bg=BG)
+
+        self._running = False
+        self._pulse_job = None
+        self._pulse_state = 0
+        self._active_color = CYAN
+        self._helper = find_privilege_helper()
+
+        self._title_font = pick_font(
+            self, ["Segoe UI Semibold", "Helvetica Neue", "Arial", "Sans"], 22, "bold"
+        )
+        self._sub_font = pick_font(
+            self, ["Segoe UI", "Helvetica Neue", "Arial", "Sans"], 10
+        )
+        self._btn_font = pick_font(
+            self, ["Segoe UI Semibold", "Helvetica Neue", "Arial", "Sans"], 10, "bold"
+        )
+        self._mono_font = pick_font(
+            self, ["Cascadia Code", "Consolas", "DejaVu Sans Mono", "Monospace"], 10
+        )
+
+        self._build_style()
+        self._build_ui()
+
+        if not self._helper:
+            self._log(
+                "! Neither pkexec nor sudo was found on this system.\n"
+                "! Privileged actions will not work until one is installed.\n"
+            )
+        if not shutil.which("xbps-install"):
+            self._log(
+                "! xbps-install was not found. This tool only works on\n"
+                "! Void Linux (or a system with xbps installed).\n"
+            )
+
+    # -------------------------------------------------------------- style --
+    def _build_style(self):
+        style = ttk.Style(self)
+        style.theme_use("clam")
+
+        style.configure("TFrame", background=BG)
+        style.configure("Panel.TFrame", background=PANEL_BG)
+        style.configure(
+            "TLabel", background=BG, foreground=TEXT_DIM, font=self._sub_font
+        )
+        style.configure(
+            "Status.TLabel",
+            background=PANEL_BG,
+            foreground=TEXT_MAIN,
+            font=self._sub_font,
+        )
+
+        style.configure(
+            "Vertical.TScrollbar",
+            background=PANEL_BG,
+            troughcolor=BG,
+            bordercolor=BG,
+            arrowcolor=TEXT_DIM,
+            relief="flat",
+        )
+        style.map("Vertical.TScrollbar", background=[("active", BORDER)])
+
+        def make_button_style(name, color, dim):
+            style.configure(
+                f"{name}.TButton",
+                background=color,
+                foreground=BG,
+                font=self._btn_font,
+                borderwidth=0,
+                focusthickness=0,
+                padding=(14, 10),
+            )
+            style.map(
+                f"{name}.TButton",
+                background=[("active", TEXT_MAIN), ("disabled", dim)],
+                foreground=[("disabled", TEXT_DIM)],
+            )
+
+        make_button_style("Cyan", CYAN, CYAN_DIM)
+        make_button_style("Magenta", MAGENTA, MAGENTA_DIM)
+        make_button_style("Amber", AMBER, AMBER_DIM)
+        make_button_style("Green", GREEN, GREEN_DIM)
+
+    # ---------------------------------------------------------- UI layout --
+    def _build_ui(self):
+        # ---- header --------------------------------------------------
+        self.header = tk.Canvas(
+            self, height=92, bg=BG, highlightthickness=0, bd=0
+        )
+        self.header.pack(fill="x")
+        self.header.bind("<Configure>", lambda e: self._draw_header())
+
+        # ---- action bar ------------------------------------------------
+        bar = ttk.Frame(self, padding=(16, 4, 16, 10))
+        bar.pack(fill="x")
+
+        self.btn_check = ttk.Button(
+            bar,
+            text="\u27f3  SYNC & CHECK",
+            style="Cyan.TButton",
+            command=self.action_check,
+        )
+        self.btn_check.pack(side="left", padx=(0, 8), ipady=2)
+
+        self.btn_update = ttk.Button(
+            bar,
+            text="\u2b06  UPDATE SYSTEM",
+            style="Magenta.TButton",
+            command=self.action_update,
+        )
+        self.btn_update.pack(side="left", padx=8, ipady=2)
+
+        self.btn_orphans = ttk.Button(
+            bar,
+            text="\u2715  REMOVE ORPHANS",
+            style="Amber.TButton",
+            command=self.action_orphans,
+        )
+        self.btn_orphans.pack(side="left", padx=8, ipady=2)
+
+        self.btn_cache = ttk.Button(
+            bar,
+            text="\u25a6  CLEAN CACHE",
+            style="Green.TButton",
+            command=self.action_clean_cache,
+        )
+        self.btn_cache.pack(side="left", padx=(8, 0), ipady=2)
+
+        self._buttons = (self.btn_check, self.btn_update, self.btn_orphans, self.btn_cache)
+
+        # ---- status strip ----------------------------------------------
+        status_wrap = tk.Frame(self, bg=PANEL_BG, highlightbackground=BORDER,
+                                highlightthickness=1, bd=0)
+        status_wrap.pack(fill="x", padx=16, pady=(0, 10))
+
+        self.status_dot = tk.Canvas(
+            status_wrap, width=16, height=16, bg=PANEL_BG, highlightthickness=0
+        )
+        self.status_dot.pack(side="left", padx=(12, 8), pady=8)
+        self._dot_item = self.status_dot.create_oval(2, 2, 14, 14, fill=CYAN, outline="")
+
+        self.status_text = ttk.Label(
+            status_wrap, text="READY", style="Status.TLabel"
+        )
+        self.status_text.pack(side="left", pady=8)
+
+        # ---- log panel ---------------------------------------------------
+        body = tk.Frame(self, bg=BG)
+        body.pack(fill="both", expand=True, padx=16, pady=(0, 16))
+
+        log_frame = tk.Frame(
+            body, bg=LOG_BG, highlightbackground=BORDER, highlightthickness=1, bd=0
+        )
+        log_frame.pack(fill="both", expand=True)
+
+        self.log = tk.Text(
+            log_frame,
+            wrap="word",
+            state="disabled",
+            background=LOG_BG,
+            foreground=TEXT_MAIN,
+            insertbackground=TEXT_MAIN,
+            font=self._mono_font,
+            bd=0,
+            padx=12,
+            pady=10,
+            highlightthickness=0,
+        )
+        scrollbar = ttk.Scrollbar(log_frame, command=self.log.yview)
+        self.log.configure(yscrollcommand=scrollbar.set)
+        self.log.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        self.log.tag_configure("cmd", foreground=MAGENTA)
+        self.log.tag_configure("exit_ok", foreground=GREEN)
+        self.log.tag_configure("exit_bad", foreground=RED)
+        self.log.tag_configure("warn", foreground=AMBER)
+        self.log.tag_configure("dim", foreground=TEXT_DIM)
+
+        self._log(
+            "VOID UPDATE TOOLBOX ONLINE\n"
+            "Scope: package management only (xbps-install / xbps-remove)\n",
+            "dim",
+        )
+
+    def _draw_header(self):
+        c = self.header
+        c.delete("all")
+        w = max(c.winfo_width(), 1)
+
+        # subtle hex accent
+        cx, cy, r = 46, 46, 22
+        pts = []
+        import math
+        for i in range(6):
+            ang = math.pi / 3 * i - math.pi / 6
+            pts.append(cx + r * math.cos(ang))
+            pts.append(cy + r * math.sin(ang))
+        c.create_polygon(*pts, outline=CYAN, fill="", width=2)
+        c.create_line(cx - 9, cy, cx + 4, cy + 9, fill=MAGENTA, width=3,
+                       capstyle="round")
+        c.create_line(cx + 4, cy + 9, cx + 11, cy - 8, fill=CYAN, width=3,
+                       capstyle="round")
+
+        # gradient title text, letter by letter
+        title = spaced("VOID UPDATE TOOLBOX", " ")
+        x = 84
+        y = 32
+        n = max(len(title) - 1, 1)
+        for i, ch in enumerate(title):
+            color = lerp_color(CYAN, MAGENTA, i / n)
+            c.create_text(
+                x, y, text=ch, anchor="nw", fill=color, font=self._title_font
+            )
+            x += self._title_font.measure(ch)
+
+        c.create_text(
+            85, 60, text=spaced("XBPS PACKAGE CONTROL", " "),
+            anchor="nw", fill=TEXT_DIM, font=self._sub_font,
+        )
+
+        # gradient underline
+        bar_y = 88
+        steps = 60
+        seg_w = w / steps
+        for i in range(steps):
+            t = i / (steps - 1)
+            color = lerp_color(CYAN, MAGENTA, t)
+            c.create_rectangle(
+                i * seg_w, bar_y, (i + 1) * seg_w + 1, bar_y + 2,
+                fill=color, outline=""
+            )
+
+    # -------------------------------------------------------------- log --
+    def _classify_tag(self, line):
+        low = line.lower()
+        if line.startswith("$ "):
+            return "cmd"
+        if line.startswith("[exit code"):
+            return "exit_ok" if "[exit code 0]" in line else "exit_bad"
+        if "warning" in low or "error" in low or low.startswith("!"):
+            return "warn"
+        return None
+
+    def _log(self, text, tag=None):
+        self.log.configure(state="normal")
+        if tag:
+            self.log.insert("end", text, tag)
+        else:
+            self.log.insert("end", text)
+        self.log.see("end")
+        self.log.configure(state="disabled")
+
+    def _log_line(self, line):
+        tag = self._classify_tag(line)
+        self._log(line, tag)
+
+    # --------------------------------------------------------- pulse dot --
+    def _start_pulse(self, color):
+        self._active_color = color
+        self._pulse_state = 0
+        self._pulse_tick()
+
+    def _pulse_tick(self):
+        if not self._running:
+            self.status_dot.itemconfig(self._dot_item, fill=self._active_color)
+            self._pulse_job = None
+            return
+        t = 0.35 if self._pulse_state % 2 == 0 else 1.0
+        dimmed = lerp_color(PANEL_BG, self._active_color, t)
+        self.status_dot.itemconfig(self._dot_item, fill=dimmed)
+        self._pulse_state += 1
+        self._pulse_job = self.after(420, self._pulse_tick)
+
+    # -------------------------------------------------------------- busy --
+    def _set_busy(self, busy, status_text="", color=CYAN):
+        self._running = busy
+        state = "disabled" if busy else "normal"
+        for b in self._buttons:
+            b.configure(state=state)
+        if status_text:
+            self.status_text.configure(text=status_text.upper())
+        if busy:
+            self._start_pulse(color)
+        else:
+            self.status_dot.itemconfig(self._dot_item, fill=CYAN)
+
+    # --------------------------------------------------------- commands --
+    def _run_command(self, cmd, needs_root, status_text, color, confirm=None):
+        if self._running:
+            return
+        if confirm and not messagebox.askyesno(APP_TITLE, confirm):
+            return
+
+        if needs_root:
+            if not self._helper:
+                messagebox.showerror(APP_TITLE, "No privilege helper (pkexec/sudo) found.")
+                return
+            cmd = [self._helper] + cmd
+
+        self._set_busy(True, status_text, color)
+        self._log(f"\n$ {' '.join(cmd)}\n", "cmd")
+
+        def worker():
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                )
+                for line in proc.stdout:
+                    self.after(0, self._log_line, line)
+                proc.wait()
+                self.after(0, self._log_line, f"\n[exit code {proc.returncode}]\n")
+            except FileNotFoundError as e:
+                self.after(0, self._log_line, f"! Error: {e}\n")
+            finally:
+                self.after(0, self._set_busy, False, "Ready.")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def action_check(self):
+        self._run_command(
+            ["xbps-install", "-Sun"],
+            needs_root=True,
+            status_text="Syncing repository data & checking for updates\u2026",
+            color=CYAN,
+        )
+
+    def action_update(self):
+        self._run_command(
+            ["xbps-install", "-Suy"],
+            needs_root=True,
+            status_text="Updating system packages\u2026",
+            color=MAGENTA,
+            confirm=(
+                "This will sync the repository index and upgrade all "
+                "installed packages. Continue?"
+            ),
+        )
+
+    def action_orphans(self):
+        self._run_command(
+            ["xbps-remove", "-oy"],
+            needs_root=True,
+            status_text="Removing orphaned packages\u2026",
+            color=AMBER,
+            confirm=(
+                "Remove packages that are no longer required by anything "
+                "else on the system?"
+            ),
+        )
+
+    def action_clean_cache(self):
+        self._run_command(
+            ["xbps-remove", "-O"],
+            needs_root=True,
+            status_text="Cleaning package cache\u2026",
+            color=GREEN,
+            confirm="Remove obsolete packages from the local download cache?",
+        )
+
+
+if __name__ == "__main__":
+    app = ToolboxApp()
+    app.mainloop()

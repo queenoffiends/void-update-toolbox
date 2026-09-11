@@ -417,7 +417,7 @@ class ToolboxApp(tk.Tk):
 
     def action_update(self):
         self._run_command(
-            ["xbps-install", "-Suy"],
+            ["xbps-install", "-S"],
             needs_root=True,
             status_text="Updating system packages\u2026",
             color=MAGENTA,
